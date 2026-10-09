@@ -26,3 +26,29 @@ class AgentMaxStepsError(AgentError):
             f"Maximum agent steps ({max_steps}) exhausted for task #{task_id} "
             f"without a final answer."
         )
+
+
+class AgentMalformedToolCallError(AgentError):
+    """
+    Raised when the agent exhausts its bounded recovery budget after the model
+    repeatedly emitted malformed TOOL_CALL blocks that the strict parser
+    rejected.
+
+    This does NOT weaken the parser: ``_extract_tool_call`` remains strict and
+    still refuses to parse a malformed block. The error is raised only by the
+    agent lifecycle, and only after the model has been given a bounded number
+    of chances to regenerate a valid TOOL_CALL and failed to do so.
+
+    By the time it is raised, the task has already been persisted in the
+    FAILED state via the standard task-failure path, so the task is never
+    left in an ambiguous state.
+    """
+
+    def __init__(self, task_id: int, task: str, attempts: int):
+        self.task_id = task_id
+        self.attempts = attempts
+        super().__init__(
+            f"Task #{task_id} failed: the model repeatedly produced "
+            f"malformed TOOL_CALL blocks that could not be regenerated into a "
+            f"valid call ({attempts} recovery attempts exhausted)."
+        )

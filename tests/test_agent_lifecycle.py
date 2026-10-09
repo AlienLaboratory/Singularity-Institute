@@ -32,12 +32,22 @@ class FakeLLM:
     def __init__(self, responses):
         self.responses = list(responses)
         self.calls = 0
+        # Records the `messages` passed to each chat() call so tests can
+        # inspect what the agent sent to the model (e.g. recovery prompts).
+        self.messages_log = []
 
     def chat(self, messages):
         self.calls += 1
+        # Snapshot a copy: the agent mutates the list in-place each turn,
+        # so storing a reference would alias every entry to the final list.
+        self.messages_log.append([dict(m) for m in messages])
         if not self.responses:
             raise AssertionError("FakeLLM exhausted - unexpected extra call")
         return self.responses.pop(0)
+
+    def last_prompt(self):
+        """The content of the last message sent to the model."""
+        return self.messages_log[-1][-1]["content"]
 
 
 class EchoTool(ToolBase):
@@ -138,7 +148,19 @@ class AgentLifecycleTest(unittest.TestCase):
 
     # ------------------------------------------------------------------
     def test_normal_final_answer_completion(self):
-        llm = FakeLLM(["Final answer text."])
+        """
+        A legitimate final answer (no TOOL_CALL) still completes the task
+        normally.
+
+        Because a pre-tool non-tool response is indistinguishable from a
+        narration of intent, the agent issues a bounded recovery prompt and
+        accepts the model's confirming (still non-tool) response as the final
+        answer. No TOOL_CALL is required for a final answer.
+        """
+        llm = FakeLLM([
+            "I'll summarize the findings.",
+            "Final answer text."
+        ])
         agent = Agent(llm=llm, tools=FakeRegistry([EchoTool()]),
                       database=self.db, max_steps=5)
 
@@ -149,7 +171,11 @@ class AgentLifecycleTest(unittest.TestCase):
         self.assertEqual(result.answer, "Final answer text.")
         self.assertEqual(self._task_status(), "completed")
         self.assertIn("task_started", self._events())
+        self.assertIn("recovery_prompt", self._events())
         self.assertIn("task_completed", self._events())
+        # No TOOL_CALL was required for the final answer.
+        cur = self.db.connection.execute("SELECT COUNT(*) AS n FROM tool_calls")
+        self.assertEqual(cur.fetchone()["n"], 0)
         # str() compatibility for CLI
         self.assertEqual(str(result), "Final answer text.")
 
@@ -173,6 +199,10 @@ class AgentLifecycleTest(unittest.TestCase):
         self.assertIn("tool_requested", events)
         self.assertIn("tool_completed", events)
         self.assertIn("task_completed", events)
+
+        # A tool was executed first, so the final answer is accepted
+        # immediately (no recovery prompt needed).
+        self.assertNotIn("recovery_prompt", events)
 
         # tool_calls persistence retained
         cur = self.db.connection.execute(
@@ -288,6 +318,96 @@ class AgentLifecycleTest(unittest.TestCase):
             "tool_completed",
             "task_completed",
         ])
+
+    # ------------------------------------------------------------------
+    # Narration-recovery tests (core Agent reliability bug)
+    # ------------------------------------------------------------------
+    def test_narration_then_tool_call_recovers(self):
+        """
+        Reproduces the exact failure: the model first narrates an intended
+        action WITHOUT emitting a TOOL_CALL. The Agent must NOT terminate,
+        must ask the model to execute the action, then accept the TOOL_CALL,
+        run the tool, and finally accept the final answer.
+        """
+        llm = FakeLLM([
+            "I'll start by inspecting the repository structure and the CLI file.",
+            tool_call("echo", msg="done"),
+            "All steps completed successfully."
+        ])
+        agent = Agent(llm=llm, tools=FakeRegistry([EchoTool()]),
+                      database=self.db, max_steps=5)
+
+        result = agent.run("do an actionable task")
+
+        self.assertEqual(result.state, TaskState.COMPLETED)
+        self.assertEqual(result.answer, "All steps completed successfully.")
+        self.assertEqual(result.steps, 3)
+        self.assertEqual(self._task_status(), "completed")
+
+        # The agent did not stop on the narration: the tool executed.
+        cur = self.db.connection.execute(
+            "SELECT tool, success, result FROM tool_calls"
+        )
+        rows = list(cur.fetchall())
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["tool"], "echo")
+        self.assertEqual(rows[0]["success"], 1)
+        self.assertIn("done", rows[0]["result"])
+
+        events = self._events()
+        self.assertIn("recovery_prompt", events)
+        self.assertIn("tool_requested", events)
+        self.assertIn("tool_completed", events)
+        self.assertIn("task_completed", events)
+
+        # The recovery prompt was actually sent to the model immediately after
+        # the narration (i.e. before the second model turn produced the
+        # TOOL_CALL).
+        second_turn_messages = llm.messages_log[1]
+        last_of_second_turn = second_turn_messages[-1]["content"]
+        self.assertIn("did not include a TOOL_CALL", last_of_second_turn)
+
+    def test_repeated_narration_is_bounded(self):
+        """
+        The model repeatedly produces narration without a TOOL_CALL. Recovery
+        is bounded: the agent issues a recovery prompt a bounded number of
+        times and then accepts a non-tool response as the final answer, so
+        the task completes without an infinite loop and well before
+        max_steps. With MAX_RECOVERY_ATTEMPTS == 1, the first narration
+        triggers a single recovery prompt and the second non-tool response is
+        accepted as the final answer.
+        """
+        # Provide more narrations than the budget; the agent must not consume
+        # them all or loop forever.
+        llm = FakeLLM([
+            "I'll start by inspecting the repository.",
+            "I'll now read the file contents.",
+            "I'll wrap up my analysis."
+        ])
+        agent = Agent(llm=llm, tools=FakeRegistry([EchoTool()]),
+                      database=self.db, max_steps=8)
+
+        # Must not raise AgentMaxStepsError and must not loop forever.
+        result = agent.run("a task the model keeps narrating")
+
+        self.assertEqual(result.state, TaskState.COMPLETED)
+        self.assertEqual(self._task_status(), "completed")
+        self.assertEqual(result.steps, 2)
+
+        events = self._events()
+        self.assertIn("recovery_prompt", events)
+        self.assertIn("task_completed", events)
+        # Bounded: at most MAX_RECOVERY_ATTEMPTS recovery prompts are issued.
+        self.assertEqual(
+            events.count("recovery_prompt"),
+            agent.MAX_RECOVERY_ATTEMPTS,
+        )
+        # No tool was ever executed in this scenario.
+        cur = self.db.connection.execute("SELECT COUNT(*) AS n FROM tool_calls")
+        self.assertEqual(cur.fetchone()["n"], 0)
+        # Proof of boundedness: only two model turns were used (one recovery
+        # plus the accepted final answer), not all of max_steps.
+        self.assertEqual(llm.calls, 2)
 
 
 if __name__ == "__main__":

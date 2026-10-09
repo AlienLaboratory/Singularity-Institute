@@ -1,5 +1,6 @@
 import sqlite3
 import json
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,11 +17,25 @@ class Database:
             exist_ok=True
         )
 
+        # ``check_same_thread=False`` is required because the single shared
+        # connection is created on the main thread but is then used by the
+        # worker thread(s) that drive ``agent.run(...)`` (see core/webui.py).
+        # Without this, SQLite raises ``ProgrammingError: SQLite objects
+        # created in a thread can only be used in that same thread``.
+        # Concurrent use is still safe because WebRunner serialises tasks so
+        # at most one thread touches the connection at a time; ``self._lock``
+        # additionally guards each statement against accidental interleaving.
         self.connection = sqlite3.connect(
-            self.path
+            self.path,
+            check_same_thread=False
         )
 
         self.connection.row_factory = sqlite3.Row
+
+        # Serialises all statements / commits so two threads can never issue
+        # overlapping queries on the shared connection (prevents "database is
+        # locked" / "recursive use" errors if callers ever overlap).
+        self._lock = threading.RLock()
 
         self._initialize()
 
@@ -74,39 +89,41 @@ class Database:
 
     def create_task(self, task: str):
 
-        cursor = self.connection.execute(
-            """
-            INSERT INTO tasks
-            (task, status, created_at)
-            VALUES (?, ?, ?)
-            """,
-            (
-                task,
-                "running",
-                self._now()
+        with self._lock:
+            cursor = self.connection.execute(
+                """
+                INSERT INTO tasks
+                (task, status, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    task,
+                    "running",
+                    self._now()
+                )
             )
-        )
 
-        self.connection.commit()
+            self.connection.commit()
 
-        return cursor.lastrowid
+            return cursor.lastrowid
 
     def complete_task(self, task_id: int, status="completed"):
 
-        self.connection.execute(
-            """
-            UPDATE tasks
-            SET status = ?, completed_at = ?
-            WHERE id = ?
-            """,
-            (
-                status,
-                self._now(),
-                task_id
+        with self._lock:
+            self.connection.execute(
+                """
+                UPDATE tasks
+                SET status = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    self._now(),
+                    task_id
+                )
             )
-        )
 
-        self.connection.commit()
+            self.connection.commit()
 
     def add_message(
         self,
@@ -115,21 +132,22 @@ class Database:
         content: str
     ):
 
-        self.connection.execute(
-            """
-            INSERT INTO messages
-            (task_id, role, content, created_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                task_id,
-                role,
-                content,
-                self._now()
+        with self._lock:
+            self.connection.execute(
+                """
+                INSERT INTO messages
+                (task_id, role, content, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    role,
+                    content,
+                    self._now()
+                )
             )
-        )
 
-        self.connection.commit()
+            self.connection.commit()
 
     def add_tool_call(
         self,
@@ -139,23 +157,24 @@ class Database:
         result: dict
     ):
 
-        self.connection.execute(
-            """
-            INSERT INTO tool_calls
-            (task_id, tool, arguments, result, success, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                task_id,
-                tool,
-                json.dumps(arguments),
-                json.dumps(result),
-                int(result.get("success", False)),
-                self._now()
+        with self._lock:
+            self.connection.execute(
+                """
+                INSERT INTO tool_calls
+                (task_id, tool, arguments, result, success, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    tool,
+                    json.dumps(arguments),
+                    json.dumps(result),
+                    int(result.get("success", False)),
+                    self._now()
+                )
             )
-        )
 
-        self.connection.commit()
+            self.connection.commit()
 
     def add_event(
         self,
@@ -164,21 +183,23 @@ class Database:
         data=None
     ):
 
-        self.connection.execute(
-            """
-            INSERT INTO events
-            (task_id, event_type, data, created_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                task_id,
-                event_type,
-                json.dumps(data) if data else None,
-                self._now()
+        with self._lock:
+            self.connection.execute(
+                """
+                INSERT INTO events
+                (task_id, event_type, data, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    event_type,
+                    json.dumps(data) if data else None,
+                    self._now()
+                )
             )
-        )
 
-        self.connection.commit()
+            self.connection.commit()
 
     def close(self):
-        self.connection.close()
+        with self._lock:
+            self.connection.close()
