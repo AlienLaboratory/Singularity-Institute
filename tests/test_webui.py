@@ -365,5 +365,47 @@ class TestCliWebFlags(unittest.TestCase):
         self.assertEqual(args.prompt_file, "task.txt")
 
 
+
+# ---------------------------------------------------------------------------
+# Output panel controls (clear / collapse-expand)
+# ---------------------------------------------------------------------------
+
+class TestOutputControlsUI(unittest.TestCase):
+    """The served HTML exposes working Clear Output and Collapse/Expand
+    controls wired to the output pane, with bounded internal scrolling."""
+
+    def test_html_contains_controls_and_logic(self):
+        html = PAGE
+        # Both controls are present and labelled.
+        self.assertIn('id="clear-output"', html)
+        self.assertIn('id="collapse-output"', html)
+        self.assertIn("Clear Output", html)
+        self.assertIn("Collapse Output", html)
+        # Toggle label text for the expand state is present.
+        self.assertIn("Expand Output", html)
+        # Click handlers are wired up.
+        self.assertIn("clearEl.addEventListener('click', clearOutput)", html)
+        self.assertIn("collapseEl.addEventListener('click', toggleCollapse)", html)
+        # Collapse styling hooks exist.
+        self.assertIn(".terminal.collapsed", html)
+        self.assertIn("classList.toggle('collapsed')", html)
+
+    def test_output_panel_bounded_height(self):
+        html = PAGE
+        # The terminal has a max-height cap with internal scrolling.
+        self.assertIn("max-height: 340px", html)
+        self.assertIn("overflow-y: auto", html)
+
+    def test_controls_served_over_route(self):
+        handler = Handler(WebRunner(FakeAgent(FakeResult()), FakeDatabase()))
+        code, ctype, body = handler.route("GET", "/", b"", {})
+        self.assertEqual(code, 200)
+        text = body.decode("utf-8")
+        self.assertIn("Clear Output", text)
+        self.assertIn("Collapse Output", text)
+        self.assertIn('id="clear-output"', text)
+        self.assertIn('id="collapse-output"', text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

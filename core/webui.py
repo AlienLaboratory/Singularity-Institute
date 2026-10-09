@@ -358,8 +358,10 @@ PAGE = """<!DOCTYPE html>
       background: #111827; color: #e5e7eb; padding: 12px; border-radius: 8px;
       font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
       font-size: 12.5px; line-height: 1.5; white-space: pre-wrap;
-      height: 460px; overflow-y: auto; margin-top: 8px;
+      max-height: 340px; min-height: 140px; overflow-y: auto; margin-top: 8px;
     }
+    .terminal.collapsed { max-height: 0; min-height: 0; overflow: hidden; padding: 4px 12px; border-style: dashed; }
+    .output-actions { display: flex; gap: 8px; flex-wrap: wrap; }
     .empty { color: #6b7280; font-style: italic; }
     @media (max-width: 720px) { .row { flex-direction: column; } }
   </style>
@@ -391,7 +393,11 @@ PAGE = """<!DOCTYPE html>
 
     <div class="output-head">
       <label>Live output</label>
-      <button id="copy-output" class="copy" type="button" title="Copy the full output to the clipboard">Copy Output</button>
+      <div class="output-actions">
+        <button id="collapse-output" class="copy" type="button" title="Collapse or expand the output panel">Collapse Output</button>
+        <button id="clear-output" class="copy" type="button" title="Clear the displayed output">Clear Output</button>
+        <button id="copy-output" class="copy" type="button" title="Copy the full output to the clipboard">Copy Output</button>
+      </div>
     </div>
     <div id="output" class="terminal"><span class="empty">Output will appear here as the task runs.</span></div>
   </div>
@@ -407,6 +413,8 @@ PAGE = """<!DOCTYPE html>
       var errorEl = document.getElementById('error');
       var outputEl = document.getElementById('output');
       var copyEl = document.getElementById('copy-output');
+      var clearEl = document.getElementById('clear-output');
+      var collapseEl = document.getElementById('collapse-output');
       var lastOutput = '';
       var running = false;
 
@@ -517,8 +525,24 @@ PAGE = """<!DOCTYPE html>
         }
       }
 
+      function toggleCollapse() {
+        var collapsed = outputEl.classList.toggle('collapsed');
+        collapseEl.textContent = collapsed ? 'Expand Output' : 'Collapse Output';
+        collapseEl.title = collapsed ? 'Expand the output panel' : 'Collapse the output panel';
+      }
+
+      function clearOutput() {
+        // Local display control: empties the visible pane only. The server-side
+        // buffer is untouched; while a task is still running the next poll will
+        // simply re-render live output, which is the expected behaviour.
+        outputEl.innerHTML = '<span class="empty">Output will appear here as the task runs.</span>';
+        lastOutput = '';
+      }
+
       runEl.addEventListener('click', run);
       copyEl.addEventListener('click', copyOutput);
+      clearEl.addEventListener('click', clearOutput);
+      collapseEl.addEventListener('click', toggleCollapse);
       taskEl.addEventListener('keydown', function (e) {
         if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); run(); }
       });

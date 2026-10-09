@@ -34,3 +34,6 @@ workspace/*
 .idea/
 .DS_Store
 Thumbs.db
+
+# Scratch output captures
+test_out.txt
