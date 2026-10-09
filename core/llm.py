@@ -5,6 +5,7 @@ class OllamaClient:
     def __init__(self, base_url: str, model: str):
         self.base_url = base_url.rstrip("/")
         self.model = model
+        self.last_response: dict | None = None
 
     def chat(self, messages: list[dict]) -> str:
         response = httpx.post(
@@ -20,4 +21,5 @@ class OllamaClient:
         response.raise_for_status()
 
         data = response.json()
+        self.last_response = data
         return data["message"]["content"]
