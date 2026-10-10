@@ -1,5 +1,7 @@
 import json
-from dataclasses import dataclass
+import time
+import traceback
+from dataclasses import dataclass, field
 from enum import Enum
 
 from core.exceptions import (
@@ -7,6 +9,11 @@ from core.exceptions import (
     AgentMaxStepsError,
 )
 from memory.database import Database
+from accounting import (
+    DEFAULT_GPU_WATTS,
+    DEFAULT_TARIFF_UAH_PER_KWH,
+    TaskAccounting,
+)
 
 
 class TaskState(Enum):
@@ -30,6 +37,11 @@ class AgentResult:
 
     ``str(result)`` is the model's final answer text so that existing callers
     that simply ``print(result)`` remain compatible.
+
+    Token-usage fields (``prompt_eval_count``, ``eval_count``) are
+    accumulated across every LLM call within the task.  A value of ``None``
+    means the metadata for at least one call was missing or malformed, so
+    the total is *unavailable* rather than a silently-undercounted number.
     """
 
     task_id: int
@@ -38,6 +50,8 @@ class AgentResult:
     steps: int = 0
     error: str | None = None
     reason: str | None = None
+    prompt_eval_count: int | None = None
+    eval_count: int | None = None
 
     def __str__(self) -> str:  # keep CLI ``print(result)`` compatible
         return self.answer
@@ -139,6 +153,150 @@ class Agent:
         # Build the system prompt once, dynamically from the registry
         self._system_prompt = build_system_prompt(tools)
 
+        # Per-task token-usage accumulators (reset at the start of each run()).
+        # A value of None means the total is *unavailable* because at least
+        # one LLM call had missing or malformed metadata.
+        self._prompt_eval_total: int | None = None
+        self._eval_total: int | None = None
+
+        # Task start time (monotonic clock) used to estimate elapsed time for
+        # the electricity-cost portion of the accounting row. Set at the start
+        # of each run(); initialized to None so a task that never starts cannot
+        # produce a fabricated elapsed value.
+        self._task_start_time: float | None = None
+
+    # ------------------------------------------------------------------
+    # Token-usage accounting
+    # ------------------------------------------------------------------
+
+    def _accumulate_token_usage(self) -> None:
+        """
+        Read ``self.llm.last_response`` (if the LLM exposes it) and
+        accumulate ``prompt_eval_count`` and ``eval_count`` into the
+        per-task totals (``self._prompt_eval_total`` /
+        ``self._eval_total``).
+
+        Rules:
+          * If ``last_response`` is absent (attribute not set, or None),
+            both totals are marked **unavailable** (set to ``None``).
+          * If ``last_response`` is not a dict, both totals are marked
+            unavailable.
+          * If a field (``prompt_eval_count`` / ``eval_count``) is missing
+            from the dict, or is not a finite number (int/float, not bool),
+            the *corresponding* total is marked unavailable.
+          * Once a total is marked unavailable it stays unavailable for the
+            remainder of the task (a missing value cannot be recovered by
+            later calls).
+
+        Existing fake/test LLMs that do not define ``last_response``
+        continue to work: the totals simply become ``None``.
+        """
+
+        last_response = getattr(self.llm, "last_response", None)
+
+        if last_response is None:
+            # No metadata at all — both totals unavailable.
+            self._prompt_eval_total = None
+            self._eval_total = None
+            return
+
+        if not isinstance(last_response, dict):
+            # Malformed: expected a dict but got something else.
+            self._prompt_eval_total = None
+            self._eval_total = None
+            return
+
+        # --- prompt_eval_count ---
+        pec = last_response.get("prompt_eval_count")
+        if (
+            not isinstance(pec, (int, float))
+            or isinstance(pec, bool)
+        ):
+            self._prompt_eval_total = None  # mark unavailable
+        else:
+            if self._prompt_eval_total is not None:
+                self._prompt_eval_total += pec
+            # If already None, it stays None.
+
+        # --- eval_count ---
+        ec = last_response.get("eval_count")
+        if (
+            not isinstance(ec, (int, float))
+            or isinstance(ec, bool)
+        ):
+            self._eval_total = None  # mark unavailable
+        else:
+            if self._eval_total is not None:
+                self._eval_total += ec
+            # If already None, it stays None.
+
+    def _reset_token_usage(self) -> None:
+        """Reset per-task token totals to zero (available) for a new run."""
+        self._prompt_eval_total = 0
+        self._eval_total = 0
+
+    # ------------------------------------------------------------------
+    # Task accounting (API-equivalent cost + electricity) persistence
+    # ------------------------------------------------------------------
+
+    def _task_elapsed_seconds(self) -> float | None:
+        """
+        Return elapsed seconds since the task started, or ``None`` if the
+        start time was never recorded. ``0`` is a valid value (a task that
+        consumed no time legitimately costs no electricity).
+        """
+        if self._task_start_time is None:
+            return None
+        return time.monotonic() - self._task_start_time
+
+    def _persist_task_accounting(self, task_id: int) -> None:
+        """
+        Persist exactly one accounting row for the just-finished task.
+
+        Uses the :mod:`accounting` helpers to derive the Opus-5-equivalent API
+        cost (USD) from the accumulated prompt/eval token counts and the
+        estimated GPU electricity cost (UAH) from the measured elapsed time,
+        then stores the row via :meth:`Database.save_accounting`.
+
+        Rules honored:
+          * Missing token counts (``None``) yield an **unavailable** API cost
+            (``None`` + reason) -- never a fabricated ``0``.
+          * Electricity is estimated with the module-level default GPU
+            wattage and tariff.
+          * Any failure here is logged and swallowed: accounting persistence
+            must NEVER mask the original task outcome or exception.
+        """
+        try:
+            accounting = TaskAccounting(
+                input_tokens=self._prompt_eval_total,
+                output_tokens=self._eval_total,
+                elapsed_seconds=self._task_elapsed_seconds(),
+            ).summarize(
+                gpu_watts=DEFAULT_GPU_WATTS,
+                tariff_uah_per_kwh=DEFAULT_TARIFF_UAH_PER_KWH,
+            )
+
+            self.database.save_accounting(
+                task_id,
+                input_tokens=accounting.input_tokens,
+                output_tokens=accounting.output_tokens,
+                api_cost_usd=accounting.api_cost_usd,
+                electricity_cost_uah=accounting.electricity_cost_uah,
+                elapsed_seconds=accounting.elapsed_seconds,
+                gpu_watts=DEFAULT_GPU_WATTS,
+                tariff_uah_per_kwh=DEFAULT_TARIFF_UAH_PER_KWH,
+                api_cost_reason=accounting.api_cost_reason,
+                electricity_cost_reason=accounting.electricity_cost_reason,
+            )
+        except Exception:
+            # Accounting persistence must never mask the original task outcome
+            # or exception; log and continue.
+            traceback.print_exc()
+
+    # ------------------------------------------------------------------
+    # Main execution loop
+    # ------------------------------------------------------------------
+
     def run(self, task: str) -> AgentResult:
         """
         Execute a task through a full agent lifecycle with explicit state
@@ -180,10 +338,24 @@ class Agent:
         All recovery is bounded and always runs inside the single
         ``for range(max_steps)`` loop, so ``max_steps`` remains authoritative
         and no recovery path can loop indefinitely.
+
+        Token usage: after every successful LLM call the agent reads
+        ``self.llm.last_response`` (if available) and accumulates
+        ``prompt_eval_count`` and ``eval_count`` across all calls in the
+        task. If metadata is missing or malformed for any call the
+        corresponding total is marked ``None`` (unavailable). The totals
+        are included in the returned :class:`AgentResult` and in the
+        persisted lifecycle events.
         """
 
         task_id = self.database.create_task(task)
         state = TaskState.RUNNING
+
+        # Reset per-task token accumulators and record the task start time
+        # (used later to estimate the electricity-cost portion of the
+        # accounting row).
+        self._reset_token_usage()
+        self._task_start_time = time.monotonic()
 
         self.database.add_event(
             task_id,
@@ -238,6 +410,9 @@ class Agent:
                 print(f"\n--- STEP {steps} ---")
 
                 response = self.llm.chat(messages)
+
+                # Accumulate token usage from this successful LLM call.
+                self._accumulate_token_usage()
 
                 print(response)
 
@@ -331,14 +506,24 @@ class Agent:
                     self.database.add_event(
                         task_id,
                         "task_completed",
-                        {"state": state.value, "steps": steps}
+                        {
+                            "state": state.value,
+                            "steps": steps,
+                            "prompt_eval_count": self._prompt_eval_total,
+                            "eval_count": self._eval_total,
+                        }
                     )
+
+                    # Persist one accounting row for this completed task.
+                    self._persist_task_accounting(task_id)
 
                     return AgentResult(
                         task_id=task_id,
                         state=state,
                         answer=response,
                         steps=steps,
+                        prompt_eval_count=self._prompt_eval_total,
+                        eval_count=self._eval_total,
                     )
 
                 # A TOOL_CALL was emitted: the model is acting. From this point
@@ -417,8 +602,13 @@ class Agent:
                     "reason": reason,
                     "max_steps": self.max_steps,
                     "steps": steps,
+                    "prompt_eval_count": self._prompt_eval_total,
+                    "eval_count": self._eval_total,
                 }
             )
+
+            # Persist one accounting row for this max-steps task.
+            self._persist_task_accounting(task_id)
 
             # Raised after persistence so the task state is unambiguous.
             raise AgentMaxStepsError(
@@ -449,10 +639,24 @@ class Agent:
             self.database.add_event(
                 task_id,
                 "task_failed",
-                {"state": state.value, "error": str(e), "reason": str(e)}
+                {
+                    "state": state.value,
+                    "error": str(e),
+                    "reason": str(e),
+                    "prompt_eval_count": self._prompt_eval_total,
+                    "eval_count": self._eval_total,
+                }
             )
 
+            # Persist one accounting row for this failed task, preserving the
+            # token counts already accumulated before the failure.
+            self._persist_task_accounting(task_id)
+
             raise
+
+    # ------------------------------------------------------------------
+    # Recovery helpers
+    # ------------------------------------------------------------------
 
     def _recover_from_malformed_call(
         self,
@@ -599,6 +803,10 @@ class Agent:
             "it. If the task is in fact already complete and requires no "
             "further tool, state your final answer directly."
         )
+
+    # ------------------------------------------------------------------
+    # Tool-call extraction and execution
+    # ------------------------------------------------------------------
 
     def _extract_tool_call(self, text):
         """
